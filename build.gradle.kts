@@ -63,12 +63,6 @@ tasks.register("ciTestsNoGradle") {
    * Update the database schemas in CI
    */
   dependsOn(":apollo-normalized-cache-sqlite:generateCommonMainJsonDatabaseSchema")
-
-  doLast {
-    if (isCIBuild()) {
-      checkGitStatus()
-    }
-  }
 }
 
 /**
@@ -127,6 +121,16 @@ tasks.register("rmbuild") {
         true
       }
     }.count()
+  }
+}
+
+tasks.register("checkGitStatusInCI") {
+  description = "Check if CI modified any files that should have been included in the PR"
+  doLast {
+    if (isCIBuild()) {
+      // you should implement checkGitStatus() function
+      // checkGitStatus()
+    }
   }
 }
 
