@@ -17,9 +17,18 @@ import org.w3c.dom.WebSocket as PlatformWebSocket
  * For authentication, use connectionPayload or URL-based authentication instead of headers.
  */
 
+// Node.js detection for wasmJs - using top-level function for compiler requirements
+private fun isNodeEnvironment(): Boolean = js("typeof process !== 'undefined' && process.versions != null && process.versions.node != null")
+
 // Top-level helper functions for wasmJs js() call restrictions
+// These functions assume browser WebSocket API - Node.js is not supported in wasmJs
 private fun createWebSocketSimple(url: String): PlatformWebSocket = js("new WebSocket(url)")
 private fun createWebSocketWithProtocol(url: String, protocol: String): PlatformWebSocket = js("new WebSocket(url, protocol)")
+
+// helper functions for onClose handler
+private fun isEventClean(event: JsAny): Boolean = js("event.wasClean")
+private fun getCloseCode(event: JsAny): Int? = js("event.code || null")
+private fun getCloseReason(event: JsAny): String? = js("event.reason || null")
 
 internal class WasmJsWebSocketEngine: WebSocketEngine {
   override fun newWebSocket(url: String, headers: List<HttpHeader>, listener: WebSocketListener): WebSocket {
@@ -67,11 +76,17 @@ internal class WasmJsWebSocket(
       }
     }
 
+    // Update the onclose handler
     platformWebSocket?.onclose = { event ->
       if (!disposed) {
         disposed = true
-        // For wasmJs, we simplify close handling since we can't access dynamic properties
-        listener.onClosed(null, null)
+        if (isEventClean(event)) {
+          val code = getCloseCode(event)
+          val reason = getCloseReason(event)
+          listener.onClosed(code, reason)
+        }else{
+          listener.onError(DefaultApolloException("Apollo: WebSocket was closed"))
+        }
       }
     }
   }
@@ -87,7 +102,15 @@ internal class WasmJsWebSocket(
       // For wasmJs, convert binary data to UTF-8 string as a workaround
       // This is a limitation of wasmJs WebSocket implementation - binary data support is restricted
       // The receiving end should handle the "data:application/octet-stream;charset=utf-8," prefix
-      val dataString = data.decodeToString()
+      val dataString = try {
+        data.decodeToString()
+      } catch (e: Exception) {
+        if (!disposed) {
+          disposed = true
+          listener.onError(DefaultApolloException("Apollo: Cannot send binary data that is not valid UTF-8. Only UTF-8 encoded data is supported in wasmJs WebSocket implementation."))
+        }
+        return
+      }
       socket.send("data:application/octet-stream;charset=utf-8,$dataString")
     }
   }
@@ -123,7 +146,14 @@ private fun createWebSocket(url: String, headers: List<HttpHeader>, listener: We
   val (protocolHeaders, otherHeaders) = headers.partition { it.name.equals("sec-websocket-protocol", true) }
   val protocols = protocolHeaders.map { it.value }.toTypedArray()
   
-  // For wasmJs, we only support browser environment (no Node.js)
+  // Check if running in Node.js environment - wasmJs doesn't support Node.js WebSockets
+  if (isNodeEnvironment()) {
+    listener.onError(DefaultApolloException(
+      "Apollo: WebSockets are not supported when using wasm and Node. See https://github.com/apollographql/apollo-kotlin/pull/6637 for more information."
+    ))
+    return null
+  }
+  
   if (otherHeaders.isNotEmpty()) {
     // Immediately call error callback - headers not supported in browser WebSocket API
     listener.onError(DefaultApolloException("Apollo: the WebSocket browser API doesn't allow passing headers. Use connectionPayload or other mechanisms."))
@@ -133,8 +163,12 @@ private fun createWebSocket(url: String, headers: List<HttpHeader>, listener: We
       protocols.isEmpty() -> createWebSocketSimple(url)
       protocols.size == 1 -> createWebSocketWithProtocol(url, protocols[0])
       else -> {
-        // For multiple protocols, just use the first one as wasmJs has limitations
-        createWebSocketWithProtocol(url, protocols[0])
+        // wasmJs cannot handle multiple WebSocket protocols properly
+        // The browser WebSocket API expects protocol negotiation, but wasmJs has limitations
+        listener.onError(DefaultApolloException(
+            "Apollo: wasmJs WebSocket implementation doesn't support multiple protocols."
+        ))
+        return null
       }
     }
   }
