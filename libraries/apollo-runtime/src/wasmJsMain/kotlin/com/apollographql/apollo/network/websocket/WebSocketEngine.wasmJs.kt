@@ -3,6 +3,7 @@ package com.apollographql.apollo.network.websocket
 import com.apollographql.apollo.api.http.HttpHeader
 import com.apollographql.apollo.exception.DefaultApolloException
 import org.w3c.dom.WebSocket as PlatformWebSocket
+import org.khronos.webgl.ArrayBufferView
 
 /**
  * WebSocket implementation for wasmJs platform.
@@ -10,7 +11,7 @@ import org.w3c.dom.WebSocket as PlatformWebSocket
  * This implementation has several limitations due to wasmJs platform constraints:
  * - Only browser WebSocket API is supported (no Node.js)
  * - Custom HTTP headers are not supported (browser WebSocket API limitation)
- * - Binary data is converted to UTF-8 strings with a data URI prefix
+ * - Binary data is properly supported using ArrayBufferView for sending and Uint8Array for receiving
  * - Multiple protocols are simplified to use only the first one
  * - Complex js() function calls are split into simple helper functions
  * 
@@ -29,6 +30,38 @@ private fun createWebSocketWithProtocol(url: String, protocol: String): Platform
 private fun isEventClean(event: JsAny): Boolean = js("event.wasClean")
 private fun getCloseCode(event: JsAny): Int? = js("event.code || null")
 private fun getCloseReason(event: JsAny): String? = js("event.reason || null")
+
+// Binary data detection and conversion helper functions
+private fun isArrayBuffer(data: JsAny): Boolean = js("data instanceof ArrayBuffer")
+private fun isUint8Array(data: JsAny): Boolean = js("data instanceof Uint8Array")
+private fun arrayBufferToUint8Array(buffer: JsAny): JsAny = js("new Uint8Array(buffer)")
+
+// Helper functions for array access - following wasmJs pattern from LibEs5.kt
+private fun getUint8ArrayLength(uint8Array: JsAny): Int = js("uint8Array.length")
+private fun getUint8ArrayValue(uint8Array: JsAny, index: Int): Int = js("uint8Array[index]")
+private fun setUint8ArrayValue(uint8Array: JsAny, index: Int, value: Int): Unit = js("uint8Array[index] = value")
+private fun createUint8Array(length: Int): JsAny = js("new Uint8Array(length)")
+
+// Convert JavaScript Uint8Array to Kotlin ByteArray using wasmJs interop
+private fun uint8ArrayToByteArray(uint8Array: JsAny): ByteArray {
+  val length = getUint8ArrayLength(uint8Array)
+  val byteArray = ByteArray(length)
+  for (i in 0 until length) {
+    val intValue = getUint8ArrayValue(uint8Array, i)
+    byteArray[i] = intValue.toByte()
+  }
+  return byteArray
+}
+
+// Convert Kotlin ByteArray to JavaScript Uint8Array for sending binary data
+private fun byteArrayToUint8Array(byteArray: ByteArray): JsAny {
+  val uint8Array = createUint8Array(byteArray.size)
+  for (i in byteArray.indices) {
+    val value = byteArray[i].toInt() and 0xFF
+    setUint8ArrayValue(uint8Array, i, value)
+  }
+  return uint8Array
+}
 
 internal class WasmJsWebSocketEngine: WebSocketEngine {
   override fun newWebSocket(url: String, headers: List<HttpHeader>, listener: WebSocketListener): WebSocket {
@@ -63,9 +96,20 @@ internal class WasmJsWebSocket(
     platformWebSocket?.onmessage = { event ->
       val data = event.data
       if (data != null) {
-        // For wasmJs, we assume all messages are strings since binary data handling is limited
-        val stringData = data.toString()
-        listener.onMessage(stringData)
+        // Detect and handle both binary (ArrayBuffer/Uint8Array) and text data
+        // This uses wasmJs array interoperability to properly convert binary data
+        if (isArrayBuffer(data) || isUint8Array(data)) {
+          val uint8Array = if (isArrayBuffer(data)) {
+            arrayBufferToUint8Array(data)
+          } else {
+            data
+          }
+          val byteArray = uint8ArrayToByteArray(uint8Array)
+          listener.onMessage(byteArray)
+        } else {
+          val stringData = data.toString()
+          listener.onMessage(stringData)
+        }
       }
     }
 
@@ -99,19 +143,8 @@ internal class WasmJsWebSocket(
           listener.onError(DefaultApolloException("Apollo: Too much data queued"))
         }
       }
-      // For wasmJs, convert binary data to UTF-8 string as a workaround
-      // This is a limitation of wasmJs WebSocket implementation - binary data support is restricted
-      // The receiving end should handle the "data:application/octet-stream;charset=utf-8," prefix
-      val dataString = try {
-        data.decodeToString()
-      } catch (e: Exception) {
-        if (!disposed) {
-          disposed = true
-          listener.onError(DefaultApolloException("Apollo: Cannot send binary data that is not valid UTF-8. Only UTF-8 encoded data is supported in wasmJs WebSocket implementation."))
-        }
-        return
-      }
-      socket.send("data:application/octet-stream;charset=utf-8,$dataString")
+      // Convert Kotlin ByteArray to JavaScript Uint8Array for proper binary WebSocket transmission
+      socket.send(byteArrayToUint8Array(data).unsafeCast<ArrayBufferView>())
     }
   }
 
